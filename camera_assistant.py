@@ -410,7 +410,9 @@ class CameraAssistant:
             for (bx, by, bw, bh) in bodies:
                 cv2.rectangle(frame, (bx, by), (bx + bw, by + bh),
                               ACCENTS["body"], 2, cv2.LINE_AA)
-            if bodies.any():
+            if isinstance(bodies, (list, tuple)):
+                pass  # no bodies
+            elif bodies.any():
                 parts.append(f"🧍 {len(bodies)} body")
 
             # also upper body
@@ -420,7 +422,9 @@ class CameraAssistant:
             for (ux, uy, uw, uh) in uppers:
                 cv2.rectangle(frame, (ux, uy), (ux + uw, uy + uh),
                               ACCENTS["body"], 1, cv2.LINE_AA)
-            if uppers.any() and not bodies.any():
+            if isinstance(uppers, (list, tuple)):
+                pass  # no upper bodies
+            elif uppers.any() and not (isinstance(bodies, (list, tuple)) or bodies.any()):
                 parts.append(f"🧍 {len(uppers)} upper")
 
         # ── Edge (Canny) ───────────────────────────────────────────────
