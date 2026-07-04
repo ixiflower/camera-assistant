@@ -2,11 +2,12 @@
 """
 Camera Assistant — Tkinter GUI with real-time CV:
   • Face detection       • Eye detection
-  • Hand tracking (MP)   • Finger counting
+  • Hand / Finger(OCV)   • Finger counting
   • Full body detect     • Smile detection
   • Edge / Motion        • Gesture recognition
 
-Powered by MediaPipe Hands (21 landmarks per hand) and OpenCV Haar cascades.
+Hand detection uses improved OpenCV (YCrCb skin mask + convexity defects)
+with multi-stage contour filtering. No external ML libs needed.
 """
 
 import tkinter as tk
@@ -17,14 +18,6 @@ import threading
 import time
 import os
 from typing import Optional
-
-# ── MediaPipe (0.10.x task API) ─────────────────────────────────────────────
-import mediapipe as mp
-from mediapipe.tasks.python import vision as mp_vision
-from mediapipe.tasks.python.core import base_options as mp_base
-
-# Hand landmark connections for custom skeleton drawing
-mp_hand_connections = mp_vision.HandLandmarksConnections
 
 
 # ── colour palette ──────────────────────────────────────────────────────────
@@ -90,7 +83,7 @@ class CameraAssistant:
             "face":     tk.BooleanVar(value=True),
             "eye":      tk.BooleanVar(value=False),
             "smile":    tk.BooleanVar(value=False),
-            "hand":     tk.BooleanVar(value=True),   # MediaPipe Hands
+            "hand":     tk.BooleanVar(value=True),   # YCrCb + contour
             "body":     tk.BooleanVar(value=False),
             "edge":     tk.BooleanVar(value=False),    # Canny edge
         }
@@ -100,22 +93,12 @@ class CameraAssistant:
         for name, path in CASCADES.items():
             self.classifiers[name] = cv2.CascadeClassifier(path)
 
-        # ── MediaPipe Hands (0.10.x task API) ───────────────────────────
-        model_path = os.path.join(os.path.dirname(__file__), "hand_landmarker.task")
-        if os.path.exists(model_path):
-            self.mp_hand_detector = mp_vision.HandLandmarker.create_from_options(
-                mp_vision.HandLandmarkerOptions(
-                    base_options=mp_base.BaseOptions(model_asset_path=model_path),
-                    running_mode=mp_vision.RunningMode.VIDEO,
-                    num_hands=2,
-                    min_hand_detection_confidence=0.5,
-                    min_tracking_confidence=0.5,
-                ),
-            )
-            self.mp_frame_ts = 0
-        else:
-            self.mp_hand_detector = None
-            print(f"⚠️  Hand model not found at {model_path} — hand detection disabled")
+        # ── Hand detection config ──────────────────────────────────────
+        # YCrCb ranges for skin detection (Cr~140-165, Cb~95-125)
+        self._skin_lower = (0, 130, 85)
+        self._skin_upper = (255, 180, 135)
+        # Minimum contour area as fraction of total frame area
+        self._hand_min_area_ratio = 0.008
 
         # ── build UI ───────────────────────────────────────────────────
         self._build_ui()
@@ -304,103 +287,111 @@ class CameraAssistant:
     #  CV processing
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-    MP_HAND_IDX = {
-        "THUMB_TIP": 4, "THUMB_IP": 3,
-        "INDEX_FINGER_TIP": 8, "INDEX_FINGER_PIP": 6,
-        "MIDDLE_FINGER_TIP": 12, "MIDDLE_FINGER_PIP": 10,
-        "RING_FINGER_TIP": 16, "RING_FINGER_PIP": 14,
-        "PINKY_TIP": 20, "PINKY_PIP": 18,
-        "WRIST": 0,
-    }
-
-    def _count_fingers(self, landmarks: list, handedness_label: str) -> int:
-        """Count extended fingers using 21-landmark positions.
-
-        Each landmark has .x, .y, .z (normalized 0-1).
-        Fingers are extended when tip.y < pip.y (above the PIP joint).
-        Thumb uses x-axis comparison (handedness-aware).
-        """
-        idx = self.MP_HAND_IDX
-        fingers = []
-
-        # ── Thumb: compare tip.x vs IP.x (handedness-aware) ────────────
-        thumb_tip = landmarks[idx["THUMB_TIP"]]
-        thumb_ip  = landmarks[idx["THUMB_IP"]]
-        if handedness_label == "Right":
-            fingers.append(1 if thumb_tip.x > thumb_ip.x else 0)
-        else:
-            fingers.append(1 if thumb_tip.x < thumb_ip.x else 0)
-
-        # ── Other 4 fingers: tip.y < pip.y → extended ──────────────────
-        for tip_k, pip_k in [
-            ("INDEX_FINGER_TIP", "INDEX_FINGER_PIP"),
-            ("MIDDLE_FINGER_TIP", "MIDDLE_FINGER_PIP"),
-            ("RING_FINGER_TIP", "RING_FINGER_PIP"),
-            ("PINKY_TIP", "PINKY_PIP"),
-        ]:
-            fingers.append(
-                1 if landmarks[idx[tip_k]].y < landmarks[idx[pip_k]].y else 0
-            )
-
-        return sum(fingers)
-
     def _process_hands(self, frame: cv2.Mat, parts: list[str]) -> None:
-        """MediaPipe 0.10.x task-API hand detection with landmark skeleton."""
-        if self.mp_hand_detector is None:
-            return
+        """Improved OpenCV hand detection with YCrCb skin mask + contour analysis.
 
-        self.mp_frame_ts += 1
+        Pipeline: BGR → YCrCb → inRange skin → morph open → findContours
+          → multi-stage filter (area, solidity, aspect) → convex hull
+          → convexity defects → finger counting → visualization.
+        """
         h, w, _ = frame.shape
+        min_area = int(w * h * self._hand_min_area_ratio)
 
-        # Convert BGR → RGB → mp.Image
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+        # 1. YCrCb skin mask (more lighting-robust than HSV)
+        ycrcb = cv2.cvtColor(frame, cv2.COLOR_BGR2YCrCb)
+        skin_mask = cv2.inRange(ycrcb, self._skin_lower, self._skin_upper)
 
-        # Run detection
-        result = self.mp_hand_detector.detect_for_video(
-            mp_img, timestamp_ms=self.mp_frame_ts,
+        # 2. Morphological cleanup
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        skin_mask = cv2.morphologyEx(skin_mask, cv2.MORPH_OPEN, kernel, iterations=1)
+        skin_mask = cv2.dilate(skin_mask, kernel, iterations=1)
+
+        # 3. Find contours
+        contours, _ = cv2.findContours(
+            skin_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
         )
 
-        if not result.hand_landmarks:
+        hand_contours: list[cv2.Mat] = []
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            if area < min_area:
+                continue
+
+            # Aspect ratio filter (hands are roughly 0.6–1.8 aspect)
+            _, _, cw, ch = cv2.boundingRect(cnt)
+            if cw == 0 or ch == 0:
+                continue
+            aspect = max(cw, ch) / min(cw, ch)
+            if aspect > 2.0:
+                continue
+
+            # Solidity: convex area vs actual area (hands ~0.5–0.9)
+            hull = cv2.convexHull(cnt)
+            hull_area = cv2.contourArea(hull)
+            if hull_area == 0:
+                continue
+            solidity = area / hull_area
+            if solidity < 0.4 or solidity > 0.95:
+                continue
+
+            hand_contours.append(cnt)
+
+        if not hand_contours:
             return
 
-        # Pair landmarks with handedness
-        hands_meta: list[tuple[list, str]] = []
-        for i, hand_lms in enumerate(result.hand_landmarks):
-            label = "Right"
-            if result.handedness and i < len(result.handedness):
-                label = result.handedness[i][0].category_name
-            hands_meta.append((hand_lms, label))
+        # Sort by area descending, keep top 2 (max 2 hands)
+        hand_contours.sort(key=cv2.contourArea, reverse=True)
+        hand_contours = hand_contours[:2]
 
-        # ── Draw skeleton connections (blue lines) ─────────────────────
-        for hand_lms, _ in hands_meta:
-            for conn in mp_hand_connections.HAND_CONNECTIONS:
-                s_lm = hand_lms[conn.start]
-                e_lm = hand_lms[conn.end]
-                sx, sy = int(s_lm.x * w), int(s_lm.y * h)
-                ex, ey = int(e_lm.x * w), int(e_lm.y * h)
-                cv2.line(frame, (sx, sy), (ex, ey),
-                         _bgr("#89b4fa"), 1, cv2.LINE_AA)
+        accent = ACCENTS["hand"]
 
-            # Landmark dots (green filled + outline)
-            for lm in hand_lms:
-                cx, cy = int(lm.x * w), int(lm.y * h)
-                cv2.circle(frame, (cx, cy), 3, _bgr("#a6e3a1"), -1, cv2.LINE_AA)
-                cv2.circle(frame, (cx, cy), 5, _bgr("#a6e3a1"), 1, cv2.LINE_AA)
+        for cnt in hand_contours:
+            area = cv2.contourArea(cnt)
+            rect = cv2.boundingRect(cnt)
+            cx, cy = rect[0] + rect[2] // 2, rect[1] + rect[3] // 2
 
-        # ── Per-hand info banner ───────────────────────────────────────
-        for hand_lms, label in hands_meta:
-            n_fingers = self._count_fingers(hand_lms, label)
+            # ── Convex hull ──────────────────────────────────────────
+            hull = cv2.convexHull(cnt)
+            hull_idx = cv2.convexHull(cnt, returnPoints=False)
+            hull_area = cv2.contourArea(hull)
 
-            wrist = hand_lms[self.MP_HAND_IDX["WRIST"]]
-            wx, wy = int(wrist.x * w), int(wrist.y * h)
+            # Draw hull outline
+            cv2.drawContours(frame, [hull], -1, _bgr("#89b4fa"), 1, cv2.LINE_AA)
 
-            icon = "👈" if label == "Left" else "👉"
-            banner = f"{icon} {label}  {n_fingers}/5"
-            (bw, _), _ = cv2.getTextSize(banner, cv2.FONT_HERSHEY_SIMPLEX,
-                                         0.65, 2)
-            bx = max(0, min(wx - bw // 2, w - bw))
-            by = max(24, wy - 40)
+            # ── Convexity defects → finger counting ──────────────────
+            n_fingers = 0
+            if len(hull_idx) >= 3:
+                defects = cv2.convexityDefects(cnt, hull_idx)
+                if defects is not None:
+                    # Filter defects: depth > 10px, depth/area ratio
+                    deep_defects = []
+                    for i in range(defects.shape[0]):
+                        s, e, f, d = defects[i, 0]
+                        # d is depth*256 (fixed-point)
+                        depth_px = d / 256.0
+                        # Only count defects with significant depth
+                        if depth_px > max(12, rect[2] * 0.04):
+                            deep_defects.append((s, e, f, depth_px))
+                            # Draw defect point
+                            far = tuple(cnt[f][0])
+                            cv2.circle(frame, far, 3, _bgr("#f38ba8"), -1, cv2.LINE_AA)
+
+                    # Extended fingers ≈ deep defects + 1 (between-finger valleys)
+                    # Clamp to 0-5
+                    n_fingers = min(len(deep_defects) + 1, 5)
+                    # If contour is very compact (fist), force 0
+                    if n_fingers <= 1 and area / hull_area > 0.85:
+                        n_fingers = 0
+
+            # ── Draw contour outline ─────────────────────────────────
+            cv2.drawContours(frame, [cnt], -1, accent, 2, cv2.LINE_AA)
+
+            # ── Info banner near centroid ────────────────────────────
+            banner = f"✋ {n_fingers}/5"
+            (bw, bh), _ = cv2.getTextSize(banner, cv2.FONT_HERSHEY_SIMPLEX,
+                                          0.65, 2)
+            bx = max(0, min(cx - bw // 2, w - bw))
+            by = max(24, cy - rect[3] // 2 - 10)
 
             # Background pill
             cv2.rectangle(frame, (bx - 6, by - 22), (bx + bw + 6, by + 6),
@@ -409,21 +400,21 @@ class CameraAssistant:
                           _bgr("#2a2a3e"), 1, cv2.LINE_AA)
             cv2.putText(frame, banner, (bx, by),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.65,
-                        _bgr("#a6e3a1"), 2, cv2.LINE_AA)
+                        accent, 2, cv2.LINE_AA)
 
-            # Finger state bar
-            bar_x = max(0, min(wx - 30, w - 60))
-            bar_y = max(24, wy - 10)
+            # ── Finger state bar ─────────────────────────────────────
+            bar_x = max(0, min(cx - 30, w - 60))
+            bar_y = max(24, cy - rect[3] // 2 + 12)
             seg_h, seg_w, gap = 8, 14, 3
             for fi in range(5):
                 sx2 = bar_x + fi * (seg_w + gap)
-                clr = _bgr("#a6e3a1") if fi < n_fingers else _bgr("#45475a")
+                clr = accent if fi < n_fingers else _bgr("#45475a")
                 cv2.rectangle(frame, (sx2, bar_y), (sx2 + seg_w, bar_y + seg_h),
                               clr, -1, cv2.LINE_AA)
                 cv2.rectangle(frame, (sx2, bar_y), (sx2 + seg_w, bar_y + seg_h),
                               _bgr("#585b70"), 1, cv2.LINE_AA)
 
-        parts.append(f"🤚 {len(hands_meta)} hand(s)")
+        parts.append(f"🤚 {len(hand_contours)} hand(s)")
 
     def _process(self, frame: cv2.Mat) -> tuple[cv2.Mat, str]:
         """Apply enabled CV detections. Returns (annotated_frame, info_line)."""

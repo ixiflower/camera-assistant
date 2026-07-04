@@ -19,13 +19,12 @@ Phone (USB/ADB) → scrcpy v4l2-sink → /dev/video0 → OpenCV → Tkinter canv
 | 👤 Face | Blue bounding box + "Face" label |
 | 👁 Eye | Amber boxes inside detected faces |
 | 😊 Smile | Yellow highlight on smiles |
-| 🤚 Hand | **MediaPipe** 21-landmark skeleton + blue connections + green dots + handedness + finger count bar |
+| 🤚 Hand | **OpenCV** skin contour + convexity defects + finger count bar |
 | 🧍 Body | Purple boxes (full + upper body) |
 | ⚡ Edge | Canny edge overlay (teal tint) |
 
 - **FPS counter** displayed at top-left
-- **Finger counting via landmark positions** — reliable per-finger state (tip.y vs PIP.y)
-- **Left/Right hand classification** with directional emoji indicators
+- **Finger counting via convexity defects** — YCrCb skin segmentation + contour analysis
 - **Smart camera scan** — only checks existing `/dev/video*` devices
 - **Dark theme** — Catppuccin Mocha inspired, glassmorphism aesthetic
 
@@ -38,16 +37,18 @@ sudo pacman -S python-opencv python-pillow python-numpy v4l2loopback-dkms
 # scrcpy (phone camera pipe)
 sudo pacman -S scrcpy android-tools
 
-# MediaPipe (hand landmark model)
-pip install mediapipe
-
-# Download the hand landmark model
-curl -L -o hand_landmarker.task \
-  "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task"
-
 # Load v4l2loopback
 sudo modprobe v4l2loopback
 ```
+
+| Package    | Why |
+|------------|-----|
+| OpenCV     | Face/Haar, YCrCb skin mask, contour detection, all CV |
+| tkinter    | Built-in GUI |
+| pillow     | Frame → Tkinter canvas |
+
+> ⚠️ **No external ML libraries needed** — hand detection uses pure OpenCV
+> (YCrCb colour-space skin segmentation + convexity-defect finger counting).
 
 You also need `v4l2loopback-dkms` built for your kernel (pacman handles this).
 
