@@ -10,13 +10,18 @@ Hand detection uses improved OpenCV (YCrCb skin mask + convexity defects)
 with multi-stage contour filtering. No external ML libs needed.
 """
 
+from __future__ import annotations
+
+import os
+# Suppress OpenCV noisy logs (MUST be set BEFORE cv2 import)
+os.environ["OPENCV_LOG_LEVEL"] = "ERROR"
+
 import tkinter as tk
 from tkinter import ttk, messagebox
 import cv2
 from PIL import Image, ImageTk
 import threading
 import time
-import os
 from typing import Optional
 
 
@@ -68,15 +73,11 @@ class CameraAssistant:
         self.root.minsize(640, 480)
         self.root.configure(bg=BG)
 
-        # Suppress OpenCV noisy logs
-        import os as _os
-        _os.environ["OPENCV_LOG_LEVEL"] = "ERROR"
-
         # ── state ──────────────────────────────────────────────────────
         self.capture: Optional[cv2.VideoCapture] = None
         self.running: bool = False
         self.thread: Optional[threading.Thread] = None
-        self.available_cameras: list[int] = []
+        self.available_cameras: list[str] = []
 
         # Feature toggles
         self.features = {
@@ -199,36 +200,33 @@ class CameraAssistant:
         existing = sorted(glob.glob("/dev/video*"))
 
         def scan():
-            found = []
-            # First try existing /dev/video* devices
+            found: list[str] = []
+            # Open by DEVICE PATH — avoids V4L2 index warnings for
+            # metadata channels (/dev/video1, etc.) and works with
+            # devices that expect a specific device node.
             for dev in existing:
-                # Extract index from /dev/videoN
-                try:
-                    idx = int(dev.replace("/dev/video", ""))
-                except ValueError:
-                    continue
-                cap = cv2.VideoCapture(idx, cv2.CAP_V4L2)
+                cap = cv2.VideoCapture(dev, cv2.CAP_V4L2)
                 if cap.isOpened():
                     ok, _ = cap.read()
                     if ok:
-                        found.append(idx)
+                        found.append(dev)
                     cap.release()
-            # Fallback: scan indices 0-5 if nothing found
+            # Fallback — scan indices if nothing found by path
             if not found:
                 for i in range(6):
                     cap = cv2.VideoCapture(i, cv2.CAP_V4L2)
                     if cap.isOpened():
                         ok, _ = cap.read()
                         if ok:
-                            found.append(i)
+                            found.append(f"/dev/video{i}")
                         cap.release()
             self.root.after(0, self._scan_done, found)
 
         threading.Thread(target=scan, daemon=True).start()
 
-    def _scan_done(self, found: list[int]) -> None:
+    def _scan_done(self, found: list[str]) -> None:
         self.available_cameras = found
-        labels = [f"Camera {i}" for i in found] or ["(none)"]
+        labels = [dev for dev in found] or ["(none)"]
         self.cam_combo["values"] = labels
         if found:
             self.cam_combo.current(0)
@@ -253,15 +251,15 @@ class CameraAssistant:
         idx = self.cam_combo.current()
         if idx < 0 or idx >= len(self.available_cameras):
             return
-        cam_id = self.available_cameras[idx]
-        self.capture = cv2.VideoCapture(cam_id, cv2.CAP_V4L2)
+        dev_path = self.available_cameras[idx]
+        self.capture = cv2.VideoCapture(dev_path, cv2.CAP_V4L2)
         if not self.capture or not self.capture.isOpened():
-            messagebox.showerror("Error", f"Failed Camera {cam_id}")
+            messagebox.showerror("Error", f"Failed {dev_path}")
             return
 
         self.running = True
         self.start_btn.configure(text="■ Stop", bg=RED)
-        self.status_lbl.configure(text=f"📷 LIVE — cam {cam_id}")
+        self.status_lbl.configure(text=f"📷 LIVE — {dev_path}")
         self.cam_combo.configure(state="disabled")
         self.scan_btn.configure(state="disabled")
 
@@ -555,8 +553,8 @@ class CameraAssistant:
     def _on_select(self, _=None) -> None:
         if self.available_cameras:
             idx = self.cam_combo.current()
-            cid = self.available_cameras[idx]
-            self.status_lbl.configure(text=f"Ready — camera {cid}")
+            dev_path = self.available_cameras[idx]
+            self.status_lbl.configure(text=f"Ready — {dev_path}")
 
     def _on_close(self) -> None:
         self.running = False
