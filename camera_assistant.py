@@ -96,13 +96,18 @@ class CameraAssistant:
             self.classifiers[name] = cv2.CascadeClassifier(path)
 
         # ── Hand detection config ──────────────────────────────────────
-        # YCrCb ranges for skin detection (Cr~140-165, Cb~95-125)
-        self._skin_lower = (0, 125, 80)
-        self._skin_upper = (255, 185, 140)
+        # YCrCb ranges for skin detection
+        self._skin_lower = (0, 115, 75)
+        self._skin_upper = (255, 190, 145)
         # Minimum contour area as fraction of total frame area
         self._hand_min_area_ratio = 0.005
         # CLAHE for low-light enhancement
         self._clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+        # Background subtractor for motion-based hand detection
+        self._bg_subtractor = cv2.createBackgroundSubtractorMOG2(
+            history=200, varThreshold=36, detectShadows=False
+        )
+        self._bg_learning_rate = -1  # auto-learn
 
         # ── build UI ───────────────────────────────────────────────────
         self._build_ui()
@@ -260,6 +265,11 @@ class CameraAssistant:
             messagebox.showerror("Error", f"Failed {dev_path}")
             return
 
+        # Reset background subtractor for new session
+        self._bg_subtractor = cv2.createBackgroundSubtractorMOG2(
+            history=200, varThreshold=36, detectShadows=False
+        )
+
         self.running = True
         self.start_btn.configure(text="■ Stop", bg=RED)
         self.status_lbl.configure(text=f"📷 LIVE — {dev_path}")
@@ -289,58 +299,54 @@ class CameraAssistant:
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
     def _process_hands(self, frame: cv2.Mat, parts: list[str]) -> None:
-        """Improved OpenCV hand detection with YCrCb skin mask + contour analysis.
+        """Dual hand detection: YCrCb skin mask + MOG2 motion fallback.
 
-        Pipeline: BGR → YCrCb → inRange skin → morph open → findContours
-          → multi-stage filter (area, solidity, aspect) → convex hull
-          → convexity defects → finger counting → visualization.
+        Pipeline:
+          1. Skin mask → YCrCb inRange → morph → contours
+          2. If skin finds nothing → MOG2 motion mask → contours
+          3. Multi-stage contour filter (area, solidity, aspect)
+          4. Convex hull → convexity defects → finger count
         """
         h, w, _ = frame.shape
         min_area = int(w * h * self._hand_min_area_ratio)
 
-        # 1. YCrCb skin mask (more lighting-robust than HSV)
+        # ── Method A: YCrCb skin mask ──────────────────────────────
         ycrcb = cv2.cvtColor(frame, cv2.COLOR_BGR2YCrCb)
+        # Gaussian blur to reduce noise before inRange
+        ycrcb = cv2.GaussianBlur(ycrcb, (5, 5), 0)
         skin_mask = cv2.inRange(ycrcb, self._skin_lower, self._skin_upper)
 
-        # 2. Morphological cleanup
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
         skin_mask = cv2.morphologyEx(skin_mask, cv2.MORPH_OPEN, kernel, iterations=1)
         skin_mask = cv2.dilate(skin_mask, kernel, iterations=1)
 
-        # 3. Find contours
         contours, _ = cv2.findContours(
             skin_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
         )
+        hand_contours = self._filter_hand_contours(contours, min_area)
 
-        hand_contours: list[cv2.Mat] = []
-        for cnt in contours:
-            area = cv2.contourArea(cnt)
-            if area < min_area:
-                continue
+        method_tag = "SK"  # skin
+        if not hand_contours:
+            # ── Method B: motion-based fallback (color-independent) ──
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            gray = cv2.GaussianBlur(gray, (7, 7), 0)
+            fg_mask = self._bg_subtractor.apply(gray, learningRate=-1)
+            # Threshold to binary
+            _, fg_mask = cv2.threshold(fg_mask, 15, 255, cv2.THRESH_BINARY)
+            # Morph cleanup
+            fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_OPEN, kernel, iterations=2)
+            fg_mask = cv2.dilate(fg_mask, kernel, iterations=2)
 
-            # Aspect ratio filter (hands are roughly 0.6–1.8 aspect)
-            _, _, cw, ch = cv2.boundingRect(cnt)
-            if cw == 0 or ch == 0:
-                continue
-            aspect = max(cw, ch) / min(cw, ch)
-            if aspect > 2.0:
-                continue
-
-            # Solidity: convex area vs actual area (hands ~0.5–0.9)
-            hull = cv2.convexHull(cnt)
-            hull_area = cv2.contourArea(hull)
-            if hull_area == 0:
-                continue
-            solidity = area / hull_area
-            if solidity < 0.4 or solidity > 0.95:
-                continue
-
-            hand_contours.append(cnt)
+            motion_contours, _ = cv2.findContours(
+                fg_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+            )
+            hand_contours = self._filter_hand_contours(motion_contours, min_area)
+            method_tag = "MO"
 
         if not hand_contours:
             return
 
-        # Sort by area descending, keep top 2 (max 2 hands)
+        # Sort by area descending, keep top 2
         hand_contours.sort(key=cv2.contourArea, reverse=True)
         hand_contours = hand_contours[:2]
 
@@ -351,7 +357,7 @@ class CameraAssistant:
             rect = cv2.boundingRect(cnt)
             cx, cy = rect[0] + rect[2] // 2, rect[1] + rect[3] // 2
 
-            # ── Convex hull ──────────────────────────────────────────
+            # ── Convex hull ─────────────────────────────────────────
             hull = cv2.convexHull(cnt)
             hull_idx = cv2.convexHull(cnt, returnPoints=False)
             hull_area = cv2.contourArea(hull)
@@ -359,42 +365,34 @@ class CameraAssistant:
             # Draw hull outline
             cv2.drawContours(frame, [hull], -1, _bgr("#89b4fa"), 1, cv2.LINE_AA)
 
-            # ── Convexity defects → finger counting ──────────────────
+            # ── Convexity defects → finger counting ─────────────────
             n_fingers = 0
-            if len(hull_idx) >= 3:
+            deep_defects: list = []
+            if hull_idx is not None and len(hull_idx) >= 3:
                 defects = cv2.convexityDefects(cnt, hull_idx)
                 if defects is not None:
-                    # Filter defects: depth > 10px, depth/area ratio
-                    deep_defects = []
                     for i in range(defects.shape[0]):
                         s, e, f, d = defects[i, 0]
-                        # d is depth*256 (fixed-point)
                         depth_px = d / 256.0
-                        # Only count defects with significant depth
                         if depth_px > max(12, rect[2] * 0.04):
                             deep_defects.append((s, e, f, depth_px))
-                            # Draw defect point
                             far = tuple(cnt[f][0])
                             cv2.circle(frame, far, 3, _bgr("#f38ba8"), -1, cv2.LINE_AA)
 
-                    # Extended fingers ≈ deep defects + 1 (between-finger valleys)
-                    # Clamp to 0-5
                     n_fingers = min(len(deep_defects) + 1, 5)
-                    # If contour is very compact (fist), force 0
-                    if n_fingers <= 1 and area / hull_area > 0.85:
+                    if n_fingers <= 1 and hull_area > 0 and area / hull_area > 0.85:
                         n_fingers = 0
 
-            # ── Draw contour outline ─────────────────────────────────
+            # ── Draw contour outline ────────────────────────────────
             cv2.drawContours(frame, [cnt], -1, accent, 2, cv2.LINE_AA)
 
-            # ── Info banner near centroid ────────────────────────────
-            banner = f"✋ {n_fingers}/5"
+            # ── Info banner ─────────────────────────────────────────
+            banner = f"✋ {n_fingers}/5 [{method_tag}]"
             (bw, bh), _ = cv2.getTextSize(banner, cv2.FONT_HERSHEY_SIMPLEX,
                                           0.65, 2)
             bx = max(0, min(cx - bw // 2, w - bw))
             by = max(24, cy - rect[3] // 2 - 10)
 
-            # Background pill
             cv2.rectangle(frame, (bx - 6, by - 22), (bx + bw + 6, by + 6),
                           (17, 17, 27, 180), -1, cv2.LINE_AA)
             cv2.rectangle(frame, (bx - 6, by - 22), (bx + bw + 6, by + 6),
@@ -403,7 +401,7 @@ class CameraAssistant:
                         cv2.FONT_HERSHEY_SIMPLEX, 0.65,
                         accent, 2, cv2.LINE_AA)
 
-            # ── Finger state bar ─────────────────────────────────────
+            # Finger state bar
             bar_x = max(0, min(cx - 30, w - 60))
             bar_y = max(24, cy - rect[3] // 2 + 12)
             seg_h, seg_w, gap = 8, 14, 3
@@ -415,7 +413,40 @@ class CameraAssistant:
                 cv2.rectangle(frame, (sx2, bar_y), (sx2 + seg_w, bar_y + seg_h),
                               _bgr("#585b70"), 1, cv2.LINE_AA)
 
-        parts.append(f"🤚 {len(hand_contours)} hand(s)")
+        parts.append(f"🤚 {len(hand_contours)} hand(s) [{method_tag}]")
+
+    # ────────────────────────────────────────────────────────────────────
+    def _filter_hand_contours(
+        self,
+        contours: tuple | list,
+        min_area: int,
+    ) -> list[cv2.Mat]:
+        """Multi-stage contour filter: area, aspect ratio, solidity."""
+        hands: list[cv2.Mat] = []
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            if area < min_area:
+                continue
+
+            # Aspect ratio — hands are roughly 0.5–2.0
+            _, _, cw, ch = cv2.boundingRect(cnt)
+            if cw == 0 or ch == 0:
+                continue
+            aspect = max(cw, ch) / min(cw, ch)
+            if aspect > 2.5:
+                continue
+
+            # Solidity — convex area vs actual area (~0.4–0.95 for hands)
+            hull = cv2.convexHull(cnt)
+            hull_area = cv2.contourArea(hull)
+            if hull_area == 0:
+                continue
+            solidity = area / hull_area
+            if solidity < 0.35 or solidity > 0.96:
+                continue
+
+            hands.append(cnt)
+        return hands
 
     def _process(self, frame: cv2.Mat) -> tuple[cv2.Mat, str]:
         """Apply enabled CV detections. Returns (annotated_frame, info_line)."""
