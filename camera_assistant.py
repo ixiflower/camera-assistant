@@ -19,6 +19,7 @@ os.environ["OPENCV_LOG_LEVEL"] = "ERROR"
 import tkinter as tk
 from tkinter import ttk, messagebox
 import cv2
+import numpy as np
 from PIL import Image, ImageTk
 import threading
 import time
@@ -96,10 +97,12 @@ class CameraAssistant:
 
         # ── Hand detection config ──────────────────────────────────────
         # YCrCb ranges for skin detection (Cr~140-165, Cb~95-125)
-        self._skin_lower = (0, 130, 85)
-        self._skin_upper = (255, 180, 135)
+        self._skin_lower = (0, 125, 80)
+        self._skin_upper = (255, 185, 140)
         # Minimum contour area as fraction of total frame area
-        self._hand_min_area_ratio = 0.008
+        self._hand_min_area_ratio = 0.005
+        # CLAHE for low-light enhancement
+        self._clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
 
         # ── build UI ───────────────────────────────────────────────────
         self._build_ui()
@@ -416,6 +419,18 @@ class CameraAssistant:
 
     def _process(self, frame: cv2.Mat) -> tuple[cv2.Mat, str]:
         """Apply enabled CV detections. Returns (annotated_frame, info_line)."""
+        # 1. Enhance low-light frames with CLAHE + gamma correction
+        mean_brightness = frame.mean()
+        if mean_brightness < 120:
+            lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+            lab[:, :, 0] = self._clahe.apply(lab[:, :, 0])
+            frame = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+            # Gamma correction for very dark frames (mean < 80)
+            if mean_brightness < 80:
+                gamma = 0.6  # < 1 = brighter
+                look_up = np.array([((i / 255.0) ** gamma) * 255 for i in range(256)], dtype=np.uint8)
+                frame = cv2.LUT(frame, look_up)
+
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         h, w = frame.shape[:2]
         parts: list[str] = []
@@ -460,7 +475,7 @@ class CameraAssistant:
             if hasattr(faces, 'any') and faces.any():
                 parts.append(f"👤 {len(faces)} face(s)")
 
-        # ── Hand / Finger detection via MediaPipe ──────────────────────
+        # ── Hand / Finger detection ─────────────────────────────────────
         if self.features["hand"].get():
             self._process_hands(frame, parts)
 
