@@ -401,7 +401,18 @@ class CameraAssistant:
                         cv2.FONT_HERSHEY_SIMPLEX, 0.65,
                         accent, 2, cv2.LINE_AA)
 
-            # Finger state bar
+            # Position text below banner
+            pos_label = f"pos ({cx},{cy})"
+            (pw, ph), _ = cv2.getTextSize(pos_label, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
+            px = max(0, min(cx - pw // 2, w - pw))
+            py = by + 20
+            cv2.putText(frame, pos_label, (px, py),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45,
+                        _bgr("#a6adc8"), 1, cv2.LINE_AA)
+
+            # Draw center dot
+            cv2.circle(frame, (cx, cy), 4, accent, -1, cv2.LINE_AA)
+            cv2.circle(frame, (cx, cy), 6, _bgr("#1e1e2e"), 1, cv2.LINE_AA)
             bar_x = max(0, min(cx - 30, w - 60))
             bar_y = max(24, cy - rect[3] // 2 + 12)
             seg_h, seg_w, gap = 8, 14, 3
@@ -450,15 +461,14 @@ class CameraAssistant:
 
     def _process(self, frame: cv2.Mat) -> tuple[cv2.Mat, str]:
         """Apply enabled CV detections. Returns (annotated_frame, info_line)."""
-        # 1. Enhance low-light frames with CLAHE + gamma correction
+        # ── 1. Enhance low-light frames ────────────────────────────────
         mean_brightness = frame.mean()
         if mean_brightness < 120:
             lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
             lab[:, :, 0] = self._clahe.apply(lab[:, :, 0])
             frame = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
-            # Gamma correction for very dark frames (mean < 80)
             if mean_brightness < 80:
-                gamma = 0.6  # < 1 = brighter
+                gamma = 0.6
                 look_up = np.array([((i / 255.0) ** gamma) * 255 for i in range(256)], dtype=np.uint8)
                 frame = cv2.LUT(frame, look_up)
 
@@ -466,87 +476,74 @@ class CameraAssistant:
         h, w = frame.shape[:2]
         parts: list[str] = []
 
-        # ── Face ───────────────────────────────────────────────────────
-        if self.features["face"].get():
-            faces = self.classifiers["face"].detectMultiScale(
-                gray, scaleFactor=1.1, minNeighbors=5, minSize=(60, 60)
-            )
-            # detectMultiScale returns tuple when empty, ndarray when found
-            faces_arr = faces if isinstance(faces, list) else (faces if hasattr(faces, 'shape') else [])
-            for (x, y, fw, fh) in faces_arr:
-                cv2.rectangle(frame, (x, y), (x + fw, y + fh),
-                              ACCENTS["face"], 2, cv2.LINE_AA)
-                # label
-                cv2.putText(frame, "Face", (x, y - 6),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, ACCENTS["face"], 1)
-
-                # ── Eyes (inside each face) ──
-                if self.features["eye"].get():
-                    roi_gray = gray[y:y + fh, x:x + fw]
-                    eyes = self.classifiers["eye"].detectMultiScale(
-                        roi_gray, scaleFactor=1.15, minNeighbors=4, minSize=(20, 20)
-                    )
-                    eyes_arr = eyes if hasattr(eyes, 'shape') else []
-                    for (ex, ey, ew, eh) in eyes_arr:
-                        cv2.rectangle(frame, (x + ex, y + ey),
-                                      (x + ex + ew, y + ey + eh),
-                                      ACCENTS["eye"], 1, cv2.LINE_AA)
-
-                # ── Smile (inside face) ──
-                if self.features["smile"].get():
-                    roi_gray2 = gray[y:y + fh, x:x + fw]
-                    smiles = self.classifiers["smile"].detectMultiScale(
-                        roi_gray2, scaleFactor=1.7, minNeighbors=20, minSize=(25, 25)
-                    )
-                    smiles_arr = smiles if hasattr(smiles, 'shape') else []
-                    for (sx, sy, sw, sh) in smiles_arr:
-                        cv2.rectangle(frame, (x + sx, y + sy),
-                                      (x + sx + sw, y + sy + sh),
-                                      ACCENTS["smile"], 1, cv2.LINE_AA)
-            if hasattr(faces, 'any') and faces.any():
-                parts.append(f"👤 {len(faces)} face(s)")
-
-        # ── Hand / Finger detection ─────────────────────────────────────
+        # ── 2. Hand detection FIRST (priority) ─────────────────────────
+        hand_detected = False
         if self.features["hand"].get():
             self._process_hands(frame, parts)
+            hand_detected = any("🤚" in p for p in parts)
 
-        # ── Full / Upper body ──────────────────────────────────────────
-        if self.features["body"].get():
-            bodies = self.classifiers["fullbody"].detectMultiScale(
-                gray, scaleFactor=1.1, minNeighbors=3, minSize=(100, 200)
-            )
-            for (bx, by, bw, bh) in bodies:
-                cv2.rectangle(frame, (bx, by), (bx + bw, by + bh),
-                              ACCENTS["body"], 2, cv2.LINE_AA)
-            if isinstance(bodies, (list, tuple)):
-                pass  # no bodies
-            elif bodies.any():
-                parts.append(f"🧍 {len(bodies)} body")
+        # ── 3. Other detection — ONLY when no hand is in frame ───────
+        if not hand_detected:
+            # ── Face ─────────────────────────────────────────────────
+            if self.features["face"].get():
+                faces = self.classifiers["face"].detectMultiScale(
+                    gray, scaleFactor=1.1, minNeighbors=5, minSize=(60, 60)
+                )
+                faces_arr = faces if isinstance(faces, list) else (faces if hasattr(faces, 'shape') else [])
+                for (x, y, fw, fh) in faces_arr:
+                    cv2.rectangle(frame, (x, y), (x + fw, y + fh),
+                                  ACCENTS["face"], 2, cv2.LINE_AA)
+                    cv2.putText(frame, "Face", (x, y - 6),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, ACCENTS["face"], 1)
 
-            # also upper body
-            uppers = self.classifiers["upperbody"].detectMultiScale(
-                gray, scaleFactor=1.1, minNeighbors=3, minSize=(60, 80)
-            )
-            for (ux, uy, uw, uh) in uppers:
-                cv2.rectangle(frame, (ux, uy), (ux + uw, uy + uh),
-                              ACCENTS["body"], 1, cv2.LINE_AA)
-            if isinstance(uppers, (list, tuple)):
-                pass  # no upper bodies
-            elif uppers.any() and not (isinstance(bodies, (list, tuple)) or bodies.any()):
-                parts.append(f"🧍 {len(uppers)} upper")
+                    if self.features["eye"].get():
+                        roi_gray = gray[y:y + fh, x:x + fw]
+                        eyes = self.classifiers["eye"].detectMultiScale(
+                            roi_gray, scaleFactor=1.15, minNeighbors=4, minSize=(20, 20)
+                        )
+                        eyes_arr = eyes if hasattr(eyes, 'shape') else []
+                        for (ex, ey, ew, eh) in eyes_arr:
+                            cv2.rectangle(frame, (x + ex, y + ey),
+                                          (x + ex + ew, y + ey + eh),
+                                          ACCENTS["eye"], 1, cv2.LINE_AA)
 
-        # ── Edge (Canny) ───────────────────────────────────────────────
+                    if self.features["smile"].get():
+                        roi_gray2 = gray[y:y + fh, x:x + fw]
+                        smiles = self.classifiers["smile"].detectMultiScale(
+                            roi_gray2, scaleFactor=1.7, minNeighbors=20, minSize=(25, 25)
+                        )
+                        smiles_arr = smiles if hasattr(smiles, 'shape') else []
+                        for (sx, sy, sw, sh) in smiles_arr:
+                            cv2.rectangle(frame, (x + sx, y + sy),
+                                          (x + sx + sw, y + sy + sh),
+                                          ACCENTS["smile"], 1, cv2.LINE_AA)
+                if hasattr(faces, 'any') and faces.any():
+                    parts.append(f"👤 {len(faces)} face(s)")
+
+            # ── Full / Upper body ────────────────────────────────────
+            if self.features["body"].get():
+                bodies = self.classifiers["fullbody"].detectMultiScale(
+                    gray, scaleFactor=1.1, minNeighbors=3, minSize=(100, 200)
+                )
+                for (bx, by, bw, bh) in bodies:
+                    cv2.rectangle(frame, (bx, by), (bx + bw, by + bh),
+                                  ACCENTS["body"], 2, cv2.LINE_AA)
+                if hasattr(bodies, 'any') and bodies.any():
+                    parts.append(f"👤 {len(bodies)} body/face(s)")
+        else:
+            # Hand is detected — only draw a clean status
+            h_val, w_val = frame.shape[:2]
+            pos_text = f"HAND ACTIVE — fingers open"
+            cv2.putText(frame, pos_text, (w_val - 280, 26),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, ACCENTS["hand"], 1, cv2.LINE_AA)
+
+        # ── Edge (Canny) ─────────────────────────────────────────────────
         if self.features["edge"].get():
-            edges = cv2.Canny(gray, 80, 160)
-            edges_col = cv2.cvtColor(edges, cv2.COLOR_GRAY2BGR)
-            edges_col[:, :, 0] = 0   # keep only green channel tint
-            edges_col[:, :, 2] = 0
-            frame = cv2.addWeighted(frame, 0.7, edges_col, 0.3, 0)
-            parts.append("⚡ Edge")
+            edges = cv2.Canny(gray, 50, 150)
+            edge_bgr = cv2.cvtColor(edges, cv2.COLOR_GRAY2BGR)
+            frame = cv2.addWeighted(frame, 0.8, edge_bgr, 0.2, 0)
 
-        # ── FPS meta ───────────────────────────────────────────────────
-        label = " | ".join(parts) if parts else "No detections"
-        return frame, label
+        return (frame, "  •  ".join(parts) if parts else "")
 
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     #  Video loop
