@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""
-Camera Assistant — Tkinter GUI with real-time CV:
+"""Camera Assistant — Tkinter GUI with real-time CV:
   • Face detection       • Eye detection
-  • Hand / Finger(OCV)   • Finger counting
+  • ONNX Hand / Fingers  • Finger counting
   • Full body detect     • Smile detection
   • Edge / Motion        • Gesture recognition
 
-Hand detection uses improved OpenCV (YCrCb skin mask + convexity defects)
-with multi-stage contour filtering. No external ML libs needed.
+Hand detection uses MediaPipe-derived ONNX models (palm detection → hand landmark)
+for accurate 21-keypoint hand tracking with finger counting.
+Uses onnxruntime + OpenCV. No MediaPipe dependency.
 """
 
 from __future__ import annotations
@@ -24,6 +24,13 @@ from PIL import Image, ImageTk
 import threading
 import time
 from typing import Optional
+
+# ── ONNX hand detector ─────────────────────────────────────────────────────
+try:
+    from hand_onnx import ONNXHandDetector
+    _HAS_ONNX_HAND = True
+except ImportError:
+    _HAS_ONNX_HAND = False
 
 
 # ── colour palette ──────────────────────────────────────────────────────────
@@ -95,19 +102,26 @@ class CameraAssistant:
         for name, path in CASCADES.items():
             self.classifiers[name] = cv2.CascadeClassifier(path)
 
-        # ── Hand detection config ──────────────────────────────────────
-        # YCrCb ranges for skin detection
-        self._skin_lower = (0, 115, 75)
-        self._skin_upper = (255, 190, 145)
-        # Minimum contour area as fraction of total frame area
-        self._hand_min_area_ratio = 0.005
-        # CLAHE for low-light enhancement
-        self._clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-        # Background subtractor for motion-based hand detection
+        # ── ONNX hand detector ─────────────────────────────────────────
+        self._hand_detector = None
+        self._hand_detector_label = "cv2"  # fallback
+        if _HAS_ONNX_HAND:
+            try:
+                self._hand_detector = ONNXHandDetector(
+                    palm_model="models/palm_detection_full_inf_post_192x192.onnx",
+                    landmark_model="models/hand_landmark_sparse_Nx3x224x224.onnx",
+                    score_threshold=0.6,
+                    landmark_threshold=0.3,
+                )
+                self._hand_detector_label = "onnx"
+            except Exception as exc:
+                print(f"[camera-assistant] ONNX hand detector init failed: {exc}")
+                self._hand_detector_label = "cv2"
+
+        # Background subtractor for edge detection (if enabled)
         self._bg_subtractor = cv2.createBackgroundSubtractorMOG2(
             history=200, varThreshold=36, detectShadows=False
         )
-        self._bg_learning_rate = -1  # auto-learn
 
         # ── build UI ───────────────────────────────────────────────────
         self._build_ui()
@@ -299,122 +313,67 @@ class CameraAssistant:
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
     def _process_hands(self, frame: cv2.Mat, parts: list[str]) -> None:
-        """Dual hand detection: YCrCb skin mask + MOG2 motion fallback.
+        """ONNX hand detection — palm detection + hand landmark.
 
-        Pipeline:
-          1. Skin mask → YCrCb inRange → morph → contours
-          2. If skin finds nothing → MOG2 motion mask → contours
-          3. Multi-stage contour filter (area, solidity, aspect)
-          4. Convex hull → convexity defects → finger count
+        Shows hand bounding box, 21 landmarks, finger count, and position.
+        Uses [ONNX] tag in status.
         """
-        h, w, _ = frame.shape
-        min_area = int(w * h * self._hand_min_area_ratio)
-
-        # ── Method A: YCrCb skin mask ──────────────────────────────
-        ycrcb = cv2.cvtColor(frame, cv2.COLOR_BGR2YCrCb)
-        # Gaussian blur to reduce noise before inRange
-        ycrcb = cv2.GaussianBlur(ycrcb, (5, 5), 0)
-        skin_mask = cv2.inRange(ycrcb, self._skin_lower, self._skin_upper)
-
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-        skin_mask = cv2.morphologyEx(skin_mask, cv2.MORPH_OPEN, kernel, iterations=1)
-        skin_mask = cv2.dilate(skin_mask, kernel, iterations=1)
-
-        contours, _ = cv2.findContours(
-            skin_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-        )
-        hand_contours = self._filter_hand_contours(contours, min_area)
-
-        method_tag = "SK"  # skin
-        if not hand_contours:
-            # ── Method B: motion-based fallback (color-independent) ──
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            gray = cv2.GaussianBlur(gray, (7, 7), 0)
-            fg_mask = self._bg_subtractor.apply(gray, learningRate=-1)
-            # Threshold to binary
-            _, fg_mask = cv2.threshold(fg_mask, 15, 255, cv2.THRESH_BINARY)
-            # Morph cleanup
-            fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_OPEN, kernel, iterations=2)
-            fg_mask = cv2.dilate(fg_mask, kernel, iterations=2)
-
-            motion_contours, _ = cv2.findContours(
-                fg_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-            )
-            hand_contours = self._filter_hand_contours(motion_contours, min_area)
-            method_tag = "MO"
-
-        if not hand_contours:
+        if self._hand_detector is None:
             return
 
-        # Sort by area descending, keep top 2
-        hand_contours.sort(key=cv2.contourArea, reverse=True)
-        hand_contours = hand_contours[:2]
+        h, w = frame.shape[:2]
+
+        try:
+            results = self._hand_detector.detect(frame)
+        except Exception as exc:
+            print(f"[hand] ONNX inference failed: {exc}")
+            return
+
+        if not results:
+            return
 
         accent = ACCENTS["hand"]
 
-        for cnt in hand_contours:
-            area = cv2.contourArea(cnt)
-            rect = cv2.boundingRect(cnt)
-            cx, cy = rect[0] + rect[2] // 2, rect[1] + rect[3] // 2
+        for r in results:
+            n_fingers = r.count_fingers()
+            landmarks = r.landmarks  # 21x2 array
+            bbox = r.bounding_box()
+            bx, by, bw, bh = bbox
+            cx = bx + bw // 2
+            cy = by + bh // 2
 
-            # ── Convex hull ─────────────────────────────────────────
-            hull = cv2.convexHull(cnt)
-            hull_idx = cv2.convexHull(cnt, returnPoints=False)
-            hull_area = cv2.contourArea(hull)
+            # ── Bounding box ─────────────────────────────────────────
+            cv2.rectangle(frame, (bx, by), (bx + bw, by + bh),
+                          accent, 2, cv2.LINE_AA)
 
-            # Draw hull outline
-            cv2.drawContours(frame, [hull], -1, _bgr("#89b4fa"), 1, cv2.LINE_AA)
+            # ── Draw landmarks ───────────────────────────────────────
+            # Draw connections first (from MediaPipe topology)
+            connections = [
+                (0, 1), (1, 2), (2, 3), (3, 4),           # thumb
+                (0, 5), (5, 6), (6, 7), (7, 8),           # index
+                (0, 9), (9, 10), (10, 11), (11, 12),      # middle
+                (0, 13), (13, 14), (14, 15), (15, 16),    # ring
+                (0, 17), (17, 18), (18, 19), (19, 20),    # pinky
+                (5, 9), (9, 13), (13, 17),                # palm
+            ]
+            for a, b in connections:
+                pt1 = (int(landmarks[a, 0]), int(landmarks[a, 1]))
+                pt2 = (int(landmarks[b, 0]), int(landmarks[b, 1]))
+                # Check both points are within frame
+                if 0 <= pt1[0] < w and 0 <= pt1[1] < h and \
+                   0 <= pt2[0] < w and 0 <= pt2[1] < h:
+                    cv2.line(frame, pt1, pt2, _bgr("#89b4fa"), 1, cv2.LINE_AA)
 
-            # ── Convexity defects → finger counting ─────────────────
-            n_fingers = 0
-            deep_defects: list = []
-            if hull_idx is not None and len(hull_idx) >= 3:
-                defects = cv2.convexityDefects(cnt, hull_idx)
-                if defects is not None:
-                    for i in range(defects.shape[0]):
-                        s, e, f, d = defects[i, 0]
-                        depth_px = d / 256.0
-                        if depth_px > max(12, rect[2] * 0.04):
-                            deep_defects.append((s, e, f, depth_px))
-                            far = tuple(cnt[f][0])
-                            cv2.circle(frame, far, 3, _bgr("#f38ba8"), -1, cv2.LINE_AA)
+            # Landmark dots
+            for lm in landmarks:
+                lx, ly = int(lm[0]), int(lm[1])
+                if 0 <= lx < w and 0 <= ly < h:
+                    cv2.circle(frame, (lx, ly), 3, accent, -1, cv2.LINE_AA)
+                    cv2.circle(frame, (lx, ly), 4, _bgr("#1e1e2e"), 1, cv2.LINE_AA)
 
-                    n_fingers = min(len(deep_defects) + 1, 5)
-                    if n_fingers <= 1 and hull_area > 0 and area / hull_area > 0.85:
-                        n_fingers = 0
-
-            # ── Draw contour outline ────────────────────────────────
-            cv2.drawContours(frame, [cnt], -1, accent, 2, cv2.LINE_AA)
-
-            # ── Info banner ─────────────────────────────────────────
-            banner = f"✋ {n_fingers}/5 [{method_tag}]"
-            (bw, bh), _ = cv2.getTextSize(banner, cv2.FONT_HERSHEY_SIMPLEX,
-                                          0.65, 2)
-            bx = max(0, min(cx - bw // 2, w - bw))
-            by = max(24, cy - rect[3] // 2 - 10)
-
-            cv2.rectangle(frame, (bx - 6, by - 22), (bx + bw + 6, by + 6),
-                          (17, 17, 27, 180), -1, cv2.LINE_AA)
-            cv2.rectangle(frame, (bx - 6, by - 22), (bx + bw + 6, by + 6),
-                          _bgr("#2a2a3e"), 1, cv2.LINE_AA)
-            cv2.putText(frame, banner, (bx, by),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.65,
-                        accent, 2, cv2.LINE_AA)
-
-            # Position text below banner
-            pos_label = f"pos ({cx},{cy})"
-            (pw, ph), _ = cv2.getTextSize(pos_label, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
-            px = max(0, min(cx - pw // 2, w - pw))
-            py = by + 20
-            cv2.putText(frame, pos_label, (px, py),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.45,
-                        _bgr("#a6adc8"), 1, cv2.LINE_AA)
-
-            # Draw center dot
-            cv2.circle(frame, (cx, cy), 4, accent, -1, cv2.LINE_AA)
-            cv2.circle(frame, (cx, cy), 6, _bgr("#1e1e2e"), 1, cv2.LINE_AA)
-            bar_x = max(0, min(cx - 30, w - 60))
-            bar_y = max(24, cy - rect[3] // 2 + 12)
+            # ── Finger count bar ─────────────────────────────────────
+            bar_x = max(0, min(cx - 50, w - 100))
+            bar_y = max(24, by - 12)
             seg_h, seg_w, gap = 8, 14, 3
             for fi in range(5):
                 sx2 = bar_x + fi * (seg_w + gap)
@@ -424,53 +383,47 @@ class CameraAssistant:
                 cv2.rectangle(frame, (sx2, bar_y), (sx2 + seg_w, bar_y + seg_h),
                               _bgr("#585b70"), 1, cv2.LINE_AA)
 
-        parts.append(f"🤚 {len(hand_contours)} hand(s) [{method_tag}]")
+            # ── Info banner ─────────────────────────────────────────
+            banner = f"✋ {n_fingers}/5 [ONNX]"
+            (banner_w, banner_h), _ = cv2.getTextSize(
+                banner, cv2.FONT_HERSHEY_SIMPLEX, 0.65, 2
+            )
+            banner_x = max(0, min(cx - banner_w // 2, w - banner_w))
+            banner_y = max(24, by - 10)
 
-    # ────────────────────────────────────────────────────────────────────
-    def _filter_hand_contours(
-        self,
-        contours: tuple | list,
-        min_area: int,
-    ) -> list[cv2.Mat]:
-        """Multi-stage contour filter: area, aspect ratio, solidity."""
-        hands: list[cv2.Mat] = []
-        for cnt in contours:
-            area = cv2.contourArea(cnt)
-            if area < min_area:
-                continue
+            cv2.rectangle(frame, (banner_x - 6, banner_y - 22),
+                          (banner_x + banner_w + 6, banner_y + 6),
+                          (17, 17, 27, 180), -1, cv2.LINE_AA)
+            cv2.rectangle(frame, (banner_x - 6, banner_y - 22),
+                          (banner_x + banner_w + 6, banner_y + 6),
+                          _bgr("#2a2a3e"), 1, cv2.LINE_AA)
+            cv2.putText(frame, banner, (banner_x, banner_y),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.65,
+                        accent, 2, cv2.LINE_AA)
 
-            # Aspect ratio — hands are roughly 0.5–2.0
-            _, _, cw, ch = cv2.boundingRect(cnt)
-            if cw == 0 or ch == 0:
-                continue
-            aspect = max(cw, ch) / min(cw, ch)
-            if aspect > 2.5:
-                continue
+            # Position label
+            pos_label = f"pos ({cx},{cy})"
+            cv2.putText(frame, pos_label,
+                        (banner_x, banner_y + 20),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45,
+                        _bgr("#a6adc8"), 1, cv2.LINE_AA)
 
-            # Solidity — convex area vs actual area (~0.4–0.95 for hands)
-            hull = cv2.convexHull(cnt)
-            hull_area = cv2.contourArea(hull)
-            if hull_area == 0:
-                continue
-            solidity = area / hull_area
-            if solidity < 0.35 or solidity > 0.96:
-                continue
+            # Center dot
+            cv2.circle(frame, (cx, cy), 4, accent, -1, cv2.LINE_AA)
+            cv2.circle(frame, (cx, cy), 6, _bgr("#1e1e2e"), 1, cv2.LINE_AA)
 
-            hands.append(cnt)
-        return hands
+        parts.append(f"🤚 {len(results)} hand(s) [ONNX]")
+        # ^ old _filter_hand_contours removed — ONNX model handles all filtering
 
     def _process(self, frame: cv2.Mat) -> tuple[cv2.Mat, str]:
         """Apply enabled CV detections. Returns (annotated_frame, info_line)."""
         # ── 1. Enhance low-light frames ────────────────────────────────
         mean_brightness = frame.mean()
-        if mean_brightness < 120:
-            lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
-            lab[:, :, 0] = self._clahe.apply(lab[:, :, 0])
-            frame = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
-            if mean_brightness < 80:
-                gamma = 0.6
-                look_up = np.array([((i / 255.0) ** gamma) * 255 for i in range(256)], dtype=np.uint8)
-                frame = cv2.LUT(frame, look_up)
+        # Gamma correction for very dark frames (helps ONNX palm detection)
+        if mean_brightness < 80:
+            gamma = 0.6
+            look_up = np.array([((i / 255.0) ** gamma) * 255 for i in range(256)], dtype=np.uint8)
+            frame = cv2.LUT(frame, look_up)
 
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         h, w = frame.shape[:2]
@@ -532,9 +485,7 @@ class CameraAssistant:
                     parts.append(f"👤 {len(bodies)} body/face(s)")
         else:
             # Hand is detected — only draw a clean status
-            h_val, w_val = frame.shape[:2]
-            pos_text = f"HAND ACTIVE — fingers open"
-            cv2.putText(frame, pos_text, (w_val - 280, 26),
+            cv2.putText(frame, "✋ HAND ACTIVE — ONNX", (w - 260, 26),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, ACCENTS["hand"], 1, cv2.LINE_AA)
 
         # ── Edge (Canny) ─────────────────────────────────────────────────
